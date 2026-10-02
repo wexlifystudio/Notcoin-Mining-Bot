@@ -94,6 +94,18 @@ class Service:
         if existing:
             if existing["user_id"] != uid or existing["wallet_in"] != wallet or existing["amount_nano"] != nano:
                 return 409, {"ok": False, "error": "request_id already used with different data"}
+            if existing["status"] == "failed":
+                # 'failed' means nothing was broadcast, so trying again can never pay twice.
+                # (An admin fixes the cause, e.g. deploys the wallet, then approves again.)
+                day = utc_day()
+                if self.store.sum_day(day, COUNTED) + nano > self.cfg.daily_max_nano:
+                    return 422, {"ok": False, "status": "rejected", "error": "daily payout limit reached"}
+                if self.store.cas_status(rid, "failed", "queued",
+                                         {"error": "", "tx": "", "updated_at": time.time(), "day": day,
+                                          "notified": False, "notify_tries": 0}):
+                    self.q.put(rid)
+                    return 202, {"ok": True, "status": "queued", "retry": True}
+                return 200, {"ok": True, "status": existing["status"], "duplicate": True}
             if existing["status"] in TERMINAL:
                 self.store.update(rid, {"notified": False})
                 self._notify_async(rid)
