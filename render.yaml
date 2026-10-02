@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: notx-payout
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 1 --threads 8 --timeout 120 --bind 0.0.0.0:$PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: WALLET_MNEMONIC
+        sync: false
+      - key: API_KEY
+        generateValue: true
+      - key: CALLBACK_KEY
+        generateValue: true
+      - key: BOT_WEBHOOK_URL
+        sync: false
+      - key: MONGODB_URI
+        sync: false
+      - key: TONCENTER_API_KEY
+        sync: false
+      - key: MAX_PER_PAYOUT_NOT
+        value: "5000"
+      - key: DAILY_MAX_NOT
+        value: "50000"
+      - key: GAS_TON
+        value: "0.07"
