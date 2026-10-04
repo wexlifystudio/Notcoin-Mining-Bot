@@ -1,6 +1,7 @@
 """NOTX MINER payout backend (Flask). Start: gunicorn app:app --workers 1 --threads 8"""
 import logging
 import os
+import time
 
 import requests
 from flask import Flask, jsonify, request
@@ -44,7 +45,7 @@ def build_service():
     )
 
     def poster(url, payload):
-        return requests.post(url, json=payload, timeout=20).status_code
+        return requests.post(url, json=payload, timeout=(6, 15)).status_code
 
     return Service(cfg, store, chain, poster=poster, start_worker=True)
 
@@ -72,6 +73,38 @@ def create_app(service):
         if not authed():
             return jsonify({"ok": False, "error": "unauthorized"}), 401
         return jsonify({"ok": True, **service.overview()})
+
+    @app.get("/payouts")
+    def payouts():
+        if not authed():
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+        return jsonify({"ok": True, "payouts": service.recent(20)})
+
+    @app.get("/cancel/<int:rid>")
+    def cancel(rid):
+        if not authed():
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+        code, out = service.cancel(rid)
+        return jsonify(out), code
+
+    @app.get("/debug")
+    def debug():
+        """Where is every thread right now? Opens a stuck-worker mystery in one page."""
+        if not authed():
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+        import sys
+        import threading
+        import traceback
+        names = {t.ident: t.name for t in threading.enumerate()}
+        stacks = {}
+        for ident, frame in sys._current_frames().items():
+            lines = traceback.format_stack(frame)[-4:]
+            stacks["%s (%s)" % (names.get(ident, "?"), ident)] = [x.strip().replace("\n", " | ") for x in lines]
+        cur = service.current
+        return jsonify({"ok": True, "worker_alive": bool(service.worker and service.worker.is_alive()),
+                        "restarts": service.restarts, "queue_len": service.q.qsize(),
+                        "busy_with": cur, "seconds_in_step": int(time.time() - cur["since"]) if cur else None,
+                        "threads": stacks})
 
     @app.post("/payout")
     def payout():

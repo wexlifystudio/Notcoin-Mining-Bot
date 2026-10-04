@@ -49,6 +49,10 @@ class MemoryStore:
                 if d["status"] in terminal and not d.get("notified") and d.get("notify_tries", 0) < max_tries
             ]
 
+    def recent(self, n):
+        with self.lock:
+            return sorted((dict(d) for d in self.docs.values()), key=lambda d: d.get("created_at", 0), reverse=True)[:n]
+
     def sum_day(self, day, statuses):
         with self.lock:
             return sum(d["amount_nano"] for d in self.docs.values() if d.get("day") == day and d["status"] in statuses)
@@ -59,7 +63,11 @@ class MongoStore:
         from pymongo import MongoClient
         from pymongo.errors import DuplicateKeyError
         self._dup = DuplicateKeyError
-        self.col = MongoClient(uri, serverSelectionTimeoutMS=8000)[db_name]["payouts"]
+        # Every database call must give up in bounded time: a connection the network silently dropped
+        # would otherwise block the payout worker for many minutes.
+        self.col = MongoClient(uri, serverSelectionTimeoutMS=8000, connectTimeoutMS=8000,
+                               socketTimeoutMS=20000, maxIdleTimeMS=45000,
+                               retryReads=True, retryWrites=True)[db_name]["payouts"]
         self.col.create_index("status")
         self.col.create_index("day")
 
@@ -91,6 +99,9 @@ class MongoStore:
             "notified": {"$ne": True},
             "notify_tries": {"$not": {"$gte": max_tries}},
         }))
+
+    def recent(self, n):
+        return list(self.col.find({}).sort("created_at", -1).limit(int(n)))
 
     def sum_day(self, day, statuses):
         total = 0

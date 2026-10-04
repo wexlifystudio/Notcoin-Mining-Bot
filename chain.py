@@ -5,9 +5,13 @@ broadcast). Nothing here is imported unless the real chain is used, so the rest
 of the service can be tested without tonsdk installed.
 """
 import base64
+import logging
+import threading
 import time
 
 import requests
+
+log = logging.getLogger("chain")
 
 NOT_MASTER = "EQAvlWFDxGF2lXm67y4yzC17wYKD9A0guwPkMs1gOsM__NOT"  # Notcoin jetton master, 9 decimals
 
@@ -43,14 +47,28 @@ class TonChain:
         if api_key:
             self.http.headers["X-API-Key"] = api_key
         self._jw = None
+        # Toncenter allows ~1 request/second without a key (about 10/s with one). Going faster only
+        # produces HTTP 429 and long retry sleeps, so every call to it is spaced out here.
+        self._gap = 0.15 if api_key else 1.15
+        self._gate = threading.Lock()
+        self._last_call = 0.0
+
+    def _pace(self):
+        with self._gate:
+            wait = self._last_call + self._gap - time.time()
+            if wait > 0:
+                time.sleep(wait)
+            self._last_call = time.time()
 
     # ---------------------------------------------------------------- http helpers
     def _get(self, path, params=None, tries=4):
         last = None
         for i in range(tries):
             try:
-                r = self.http.get(self.base + path, params=params, timeout=20)
+                self._pace()
+                r = self.http.get(self.base + path, params=params, timeout=(6, 15))
                 if r.status_code == 429:
+                    log.warning("toncenter 429 on %s (try %d)", path, i + 1)
                     time.sleep(1.5 * (i + 1))
                     continue
                 r.raise_for_status()
@@ -129,7 +147,8 @@ class TonChain:
             raise NotBroadcast("could not build the transfer: %s" % ex)
 
         try:
-            r = self.http.post(self.base + "/api/v2/sendBoc", json={"boc": boc}, timeout=25)
+            self._pace()
+            r = self.http.post(self.base + "/api/v2/sendBoc", json={"boc": boc}, timeout=(6, 25))
         except Exception as ex:
             raise Ambiguous("broadcast request failed: %s" % ex)
         if r.status_code >= 500 or r.status_code == 429:
@@ -154,12 +173,14 @@ class TonChain:
                 return True
         return False
 
-    def find_tx(self, query_id):
-        """Best effort: look the transfer up by its query_id. Returns a hex tx hash or ''."""
-        for _ in range(6):
+    def find_tx(self, query_id, budget=20):
+        """Best effort, never blocks the payout queue for long: look the transfer up by its query_id
+        for at most `budget` seconds. Returns a hex tx hash or ''."""
+        end = time.time() + budget
+        while True:
             try:
                 j = self._get("/api/v3/jetton/transfers",
-                              {"owner_address": self.address, "direction": "out", "limit": 20, "sort": "desc"}, tries=2)
+                              {"owner_address": self.address, "direction": "out", "limit": 20, "sort": "desc"}, tries=1)
                 for t in j.get("jetton_transfers") or []:
                     if str(t.get("query_id")) == str(query_id):
                         h = str(t.get("transaction_hash") or "")
@@ -171,5 +192,6 @@ class TonChain:
                         return h
             except Exception:
                 pass
-            time.sleep(5)
-        return ""
+            if time.time() + 4 >= end:
+                return ""
+            time.sleep(4)
