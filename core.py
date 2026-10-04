@@ -7,6 +7,7 @@ Safety rules (read before changing anything):
 """
 import hmac
 import logging
+import os
 import queue
 import threading
 import time
@@ -59,12 +60,65 @@ class Service:
         self.current = None          # {"rid", "stage", "since"} of the payout being processed
         self.last_beat = time.time()
         self.restarts = 0
+        self.autostart = bool(start_worker)
+        self.pid = os.getpid()
+        self._lock = threading.Lock()
+        self._t = {}
         self._recover()
-        self.worker = None
         if start_worker:
-            self._start_worker()
-            threading.Thread(target=self._renotify_loop, daemon=True).start()
-            threading.Thread(target=self._watchdog_loop, daemon=True).start()
+            self.ensure_started(first=True)
+
+    @property
+    def worker(self):
+        return self._t.get("worker")
+
+    def threads_alive(self):
+        return {k: bool(self._t.get(k) is not None and self._t[k].is_alive())
+                for k in ("worker", "renotify", "watchdog")}
+
+    def ensure_started(self, first=False):
+        """Make sure the three background threads (payout worker, callback retry, watchdog) exist in THIS
+        process. Threads do not survive a fork, so if the server ever builds the service in one process and
+        serves from another, the worker would silently be missing and every payout would sit in 'queued'.
+        Called at start-up and on every incoming request (cheap when everything is fine)."""
+        if not self.autostart or self.stop:
+            return
+        if self.pid == os.getpid() and all(self.threads_alive().values()):
+            return
+        with self._lock:
+            alive = self.threads_alive()
+            if self.pid == os.getpid() and all(alive.values()):
+                return
+            if self.pid != os.getpid():
+                alive = {k: False for k in alive}
+            self.pid = os.getpid()
+            started = []
+            if not alive["worker"]:
+                self.gen += 1
+                self._start_worker()
+                started.append("worker")
+            if not alive["renotify"]:
+                self._t["renotify"] = threading.Thread(target=self._renotify_loop, daemon=True)
+                self._t["renotify"].start()
+                started.append("renotify")
+            if not alive["watchdog"]:
+                self._t["watchdog"] = threading.Thread(target=self._watchdog_loop, daemon=True)
+                self._t["watchdog"].start()
+                started.append("watchdog")
+            if started and not first:
+                self.restarts += 1
+                log.error("background threads were missing in pid %s - started: %s", self.pid, ",".join(started))
+                if "worker" in started:
+                    self.current = None
+                    for d in self.store.find_status(("sending",)):
+                        # nobody is working on it any more; it may or may not have been broadcast
+                        self.store.cas_status(d["_id"], "sending", "review", {
+                            "error": "worker was missing - check the wallet history", "updated_at": time.time(),
+                            "notified": False})
+                    for d in self.store.find_status(("queued",)):
+                        self.q.put(d["_id"])
+            elif started:
+                log.info("background threads started in pid %s", self.pid)
 
     # ------------------------------------------------------------------ auth
     def key_ok(self, given):
@@ -159,8 +213,9 @@ class Service:
 
     # ------------------------------------------------------------------ worker
     def _start_worker(self):
-        self.worker = threading.Thread(target=self._worker, args=(self.gen,), daemon=True)
-        self.worker.start()
+        t = threading.Thread(target=self._worker, args=(self.gen,), daemon=True)
+        self._t["worker"] = t
+        t.start()
 
     def _worker(self, gen):
         while not self.stop and gen == self.gen:
@@ -206,10 +261,8 @@ class Service:
             if moved:
                 self._notify_async(rid)
             return "replaced"
-        if self.worker is not None and not self.worker.is_alive() and not self.stop:
-            log.error("worker thread was dead - starting a new one")
-            self.restarts += 1
-            self._start_worker()
+        if self.autostart and not self.stop and not all(self.threads_alive().values()):
+            self.ensure_started()
             return "restarted"
         return "ok"
 
@@ -331,7 +384,7 @@ class Service:
                "per_payout_max_not": "%.4f" % (self.cfg.max_per_payout_nano / NANO),
                "review": len(self.store.find_status(("review",))),
                "queued": len(self.store.find_status(("queued", "sending"))),
-               "worker_alive": bool(self.worker and self.worker.is_alive()),
+               "worker_alive": bool(self.worker and self.worker.is_alive()), "threads": self.threads_alive(),
                "queue_len": self.q.qsize(), "worker_restarts": self.restarts,
                "busy_with": ({"request_id": self.current["rid"], "step": self.current["stage"],
                               "seconds": int(time.time() - self.current["since"])} if self.current else None)}

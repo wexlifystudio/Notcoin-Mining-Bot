@@ -53,6 +53,10 @@ def build_service():
 def create_app(service):
     app = Flask(__name__)
 
+    @app.before_request
+    def _keep_background_threads_alive():
+        service.ensure_started()
+
     def body():
         data = request.get_json(force=True, silent=True)
         if not isinstance(data, dict):
@@ -101,7 +105,9 @@ def create_app(service):
             lines = traceback.format_stack(frame)[-4:]
             stacks["%s (%s)" % (names.get(ident, "?"), ident)] = [x.strip().replace("\n", " | ") for x in lines]
         cur = service.current
+        import os
         return jsonify({"ok": True, "worker_alive": bool(service.worker and service.worker.is_alive()),
+                        "threads_alive": service.threads_alive(), "pid": os.getpid(), "service_pid": service.pid,
                         "restarts": service.restarts, "queue_len": service.q.qsize(),
                         "busy_with": cur, "seconds_in_step": int(time.time() - cur["since"]) if cur else None,
                         "threads": stacks})
